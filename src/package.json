@@ -9,5 +9,8 @@
     "@aws-sdk/client-sns": "^3.700.0",
     "@aws-sdk/lib-dynamodb": "^3.700.0",
     "@aws-sdk/s3-request-presigner": "^3.700.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
   }
 }
