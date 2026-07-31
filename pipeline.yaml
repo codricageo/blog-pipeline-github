@@ -1,0 +1,160 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Pipeline CI/CD pentru blogul serverless: GitHub -> CodePipeline -> CodeBuild
+  (sam build + sam deploy + publicare frontend). Se instalează O SINGURĂ DATĂ,
+  manual, separat de stack-ul aplicației:
+
+    aws cloudformation deploy `
+      --template-file pipeline.yaml `
+      --stack-name blog-pipeline `
+      --capabilities CAPABILITY_IAM `
+      --parameter-overrides GitHubRepo=utilizatorul-tau/numele-repo
+
+  IMPORTANT: după creare, conexiunea GitHub rămâne în starea PENDING până o
+  autorizezi manual în consolă: Developer Tools -> Settings -> Connections ->
+  "Update pending connection". Fără pasul acesta pipeline-ul nu poate citi codul.
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Description: Repo-ul GitHub în formatul owner/nume-repo (ex. ion/blog-serverless)
+  Branch:
+    Type: String
+    Default: main
+    Description: Branch-ul care declanșează pipeline-ul la fiecare push
+
+Resources:
+  # ── Conexiunea către GitHub ────────────────────────────────────────────────
+  # CodeConnections (fost CodeStar Connections) e modul modern de a lega AWS
+  # de GitHub — înlocuiește token-urile OAuth. CodeCommit nu mai e disponibil
+  # pentru conturi noi, deci GitHub e sursa recomandată.
+  GitHubConnection:
+    Type: AWS::CodeConnections::Connection
+    Properties:
+      ConnectionName: !Sub '${AWS::StackName}-github'
+      ProviderType: GitHub
+
+  # ── Bucket pentru artefacte ────────────────────────────────────────────────
+  # CodePipeline dă mai departe codul sursă între etape printr-un bucket S3.
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-artifacts-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: StergeArtefacteVechi
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ── Rolul CodeBuild ────────────────────────────────────────────────────────
+  # ATENȚIE: AdministratorAccess e acceptabil DOAR într-un cont de învățare.
+  # `sam deploy` creează/modifică multe tipuri de resurse (Lambda, DynamoDB,
+  # Cognito, SQS, SNS, CloudFront, IAM...), iar enumerarea permisiunilor exacte
+  # ar complica exemplul. În producție se folosește least-privilege.
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  # ── Proiectul CodeBuild ────────────────────────────────────────────────────
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${AWS::StackName}-build'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODEPIPELINE          # codul vine de la pipeline, nu direct din git
+        BuildSpec: buildspec.yml    # fișierul din rădăcina repo-ului
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        # Imaginea standard include SAM CLI, AWS CLI, Node.js și jq.
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+
+  # ── Rolul CodePipeline ─────────────────────────────────────────────────────
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelinePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow                       # artefactele dintre etape
+                Action: ['s3:GetObject', 's3:PutObject', 's3:GetBucketVersioning']
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow                       # citirea codului din GitHub
+                Action: codeconnections:UseConnection
+                Resource: !Ref GitHubConnection
+              - Effect: Allow                       # pornirea build-urilor
+                Action: ['codebuild:StartBuild', 'codebuild:BatchGetBuilds']
+                Resource: !GetAtt BuildProject.Arn
+
+  # ── Pipeline-ul propriu-zis ────────────────────────────────────────────────
+  # Două etape: Source (descarcă codul la fiecare push pe branch) și Build
+  # (rulează buildspec.yml, care face build + deploy + publicare frontend).
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${AWS::StackName}-pipeline'
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref GitHubConnection
+                FullRepositoryId: !Ref GitHubRepo
+                BranchName: !Ref Branch
+              OutputArtifacts:
+                - Name: SourceCode
+        - Name: Build
+          Actions:
+            - Name: BuildAndDeploy
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: SourceCode
+
+Outputs:
+  ConnectionArn:
+    Description: Conexiunea GitHub — trebuie autorizată manual în consolă (PENDING -> AVAILABLE)
+    Value: !Ref GitHubConnection
+  PipelineName:
+    Description: Numele pipeline-ului CodePipeline
+    Value: !Ref Pipeline

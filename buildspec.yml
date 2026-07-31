@@ -1,0 +1,56 @@
+### buildspec.yml — instrucțiunile pe care le rulează AWS CodeBuild.
+#
+# CodePipeline descarcă codul din GitHub și îl dă lui CodeBuild, care execută
+# fazele de mai jos într-un container Linux. E echivalentul lui deploy.ps1,
+# dar în bash și fără intervenție umană.
+#
+# Notă examen (DVA-C02): buildspec-ul are faze fixe — install, pre_build,
+# build, post_build. Variabilele de mediu vin din proiectul CodeBuild.
+
+version: 0.2
+
+env:
+  variables:
+    STACK_NAME: blog-serveless
+    AWS_REGION_DEPLOY: eu-central-1
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 22
+
+  build:
+    commands:
+      - sam build
+      # --no-confirm-changeset: în CI nu are cine să apese "y" (samconfig.toml
+      #   are confirm_changeset=true pentru deploy-ul manual, aici îl suprascriem).
+      # --no-fail-on-empty-changeset: un commit care nu schimbă infrastructura
+      #   nu trebuie să pice pipeline-ul.
+      - sam deploy --no-confirm-changeset --no-fail-on-empty-changeset
+
+  post_build:
+    commands:
+      # Citim output-urile stack-ului ca să generăm config.js și să publicăm situl.
+      - |
+        OUTPUTS=$(aws cloudformation describe-stacks \
+          --stack-name "$STACK_NAME" \
+          --region "$AWS_REGION_DEPLOY" \
+          --query 'Stacks[0].Outputs' \
+          --output json)
+        API_URL=$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey=="ApiUrl") | .OutputValue')
+        CLIENT_ID=$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey=="UserPoolClientId") | .OutputValue')
+        REGION=$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey=="Region") | .OutputValue')
+        SITE_BUCKET=$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey=="SiteBucketName") | .OutputValue')
+        DISTRIBUTION_ID=$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey=="SiteDistributionId") | .OutputValue')
+
+        cat > frontend/config.js <<EOF
+        // Generat automat de pipeline-ul CI/CD din output-urile CloudFormation.
+        window.CONFIG = {
+          API_URL: "$API_URL",
+          USER_POOL_CLIENT_ID: "$CLIENT_ID",
+          REGION: "$REGION",
+        };
+        EOF
+
+        aws s3 sync frontend/ "s3://$SITE_BUCKET" --delete --region "$AWS_REGION_DEPLOY"
+        aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "/*"

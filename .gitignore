@@ -1,0 +1,8 @@
+# Artefacte de build SAM — se regenerează cu `sam build`, nu se versionează
+.aws-sam/
+
+# Dependențe npm — instalate de `sam build` din src/package.json
+node_modules/
+
+# Fișiere temporare (ex. config.js.tmp din deploy.ps1)
+*.tmp

@@ -1,0 +1,563 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+# `Transform` transformă acest fișier dintr-un template SAM într-unul
+# CloudFormation "pur". SAM este doar o extensie a CloudFormation: îți dă tipuri
+# scurte (AWS::Serverless::*) care se expandează în zeci de resurse native.
+Transform: AWS::Serverless-2016-10-31
+
+Description: Blog serverless — DynamoDB + Lambda + HTTP API + Cognito
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    Description: Numele stage-ului API Gateway (apare în URL)
+
+  AllowedOrigin:
+    Type: String
+    Default: http://localhost:8000
+    Description: Originea de unde e servit frontend-ul (pentru CORS)
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: >-
+      Email abonat la notificările de postare nouă (gol = fără abonament).
+      Atenție - SNS trimite un email de confirmare care trebuie acceptat.
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+
+# `Globals` = setări moștenite de toate funcțiile, ca să nu le repeți de 3 ori.
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]     # Graviton: ~20% mai ieftin decât x86_64
+    CodeUri: src/              # toate 3 funcțiile împart același folder de cod
+    Timeout: 10                # secunde; peste asta Lambda e oprită forțat
+    MemorySize: 256            # MB; CPU-ul crește proporțional cu memoria
+    Environment:
+      Variables:
+        # Numele tabelului injectat ca variabilă de mediu.
+        # `!Ref` pe o resursă DynamoDB::Table returnează NUMELE tabelului.
+        TABLE_NAME: !Ref PostsTable
+
+Resources:
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 1. DynamoDB — baza de date NoSQL, complet gestionată
+  # ────────────────────────────────────────────────────────────────────────
+  # De ce DynamoDB și nu RDS? E serverless: nu administrezi servere, scalează
+  # automat, se plătește la cerere. Se potrivește perfect cu Lambda, care poate
+  # porni sute de instanțe simultan (o bază SQL s-ar sufoca la conexiuni).
+  PostsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-posts'
+      # PAY_PER_REQUEST = mod on-demand: plătești per citire/scriere, zero cost
+      # când nu îl folosești. Alternativa, PROVISIONED, îți cere să estimezi
+      # RCU/WCU dinainte — mai ieftin la trafic constant și previzibil.
+      BillingMode: PAY_PER_REQUEST
+
+      # Se declară DOAR atributele care fac parte dintr-o cheie.
+      # `title`, `content`, `author`, `createdAt` NU apar aici — DynamoDB este
+      # schemaless pentru atributele non-cheie. (Întrebare frecventă la examen.)
+      AttributeDefinitions:
+        - AttributeName: postId
+          AttributeType: S      # S = String, N = Number, B = Binary
+
+      KeySchema:
+        - AttributeName: postId
+          KeyType: HASH         # HASH = partition key. (RANGE = sort key)
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 2. Cognito User Pool — directorul de utilizatori
+  # ────────────────────────────────────────────────────────────────────────
+  # User Pool = baza de date de useri + login + emitere de tokenuri JWT.
+  # (A nu se confunda cu Identity Pool, care schimbă un token pe credențiale
+  # AWS temporare ca să apelezi direct servicii AWS. Nouă nu ne trebuie.)
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      UsernameAttributes: [email]        # userul se loghează cu email-ul
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+  # App Client = "aplicația" care are voie să vorbească cu pool-ul.
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${AWS::StackName}-web'
+      UserPoolId: !Ref UserPool
+      # OBLIGATORIU false pentru o aplicație din browser: codul JS e vizibil
+      # oricui, deci nu poate păstra un secret. (Un backend ar putea.)
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH       # login cu user+parolă, simplu
+        - ALLOW_REFRESH_TOKEN_AUTH       # obligatoriu, altfel Cognito respinge lista
+      SupportedIdentityProviders: [COGNITO]
+      # Nu divulgă dacă un email există sau nu — răspuns identic în ambele cazuri.
+      PreventUserExistenceErrors: ENABLED
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        IdToken: minutes
+        AccessToken: minutes
+        RefreshToken: days
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 3. API Gateway HTTP API — ușa de intrare publică
+  # ────────────────────────────────────────────────────────────────────────
+  # HTTP API vs REST API: HTTP API e ~70% mai ieftin și mai rapid, dar are mai
+  # puține funcții (fără API keys, fără request validation, fără WAF direct).
+  # Pentru un blog simplu e alegerea corectă.
+  BlogApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref StageName
+      FailOnWarnings: true
+
+      Auth:
+        # Authorizer aplicat implicit TUTUROR rutelor...
+        DefaultAuthorizer: CognitoJwtAuthorizer
+        Authorizers:
+          CognitoJwtAuthorizer:
+            # De unde citește API Gateway token-ul.
+            IdentitySource: '$request.header.Authorization'
+            # ATENȚIE: în SAM cheile sunt cu literă MICĂ (issuer/audience).
+            # Cu majusculă merg doar pe AWS::ApiGatewayV2::Authorizer brut.
+            JwtConfiguration:
+              # API Gateway descarcă cheile publice de la acest issuer și
+              # verifică singur semnătura, expirarea și `aud` — înainte să
+              # cheme Lambda. Deci Lambda nu scrie nicio linie de validare.
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+              audience:
+                - !Ref UserPoolClient
+
+      # CORS: browserul refuză cereri cross-origin dacă serverul nu le permite
+      # explicit. Frontend-ul rulează pe localhost:8000, API-ul pe *.amazonaws.com
+      # => origini diferite => e nevoie de asta.
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref AllowedOrigin
+          # Situl publicat prin CloudFront e o altă origine decât localhost.
+          - !Sub 'https://${SiteDistribution.DomainName}'
+        AllowHeaders:
+          - authorization
+          - content-type
+        AllowMethods:
+          - GET
+          - POST
+          - DELETE
+          - OPTIONS
+        MaxAge: 600
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 4. Funcțiile Lambda — o funcție per operație
+  # ────────────────────────────────────────────────────────────────────────
+  # De ce una per operație și nu un singur "fat lambda" cu router?
+  #  - IAM granular: fiecare are exact permisiunile ei (vezi Policies mai jos)
+  #  - metrici și loguri separate per operație
+  #  - deploy independent, cold start mai mic
+  # Dezavantaj: mai multe resurse de gestionat. Pentru învățat, e varianta bună.
+
+  CreatePostFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: createPost.handler
+      Description: Creează o postare (necesită autentificare)
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref PostEventsTopic
+      Policies:
+        # LEAST PRIVILEGE: statement IAM scris de mână, nu policy gata făcut.
+        # SAM oferă `DynamoDBCrudPolicy`, dar acela dă Put+Get+Update+Delete+
+        # Query+Scan+Batch* pe tabel ȘI pe indexuri — mult prea mult.
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem     # DOAR scriere de itemi noi
+              Resource: !GetAtt PostsTable.Arn
+            - Effect: Allow
+              Action: sns:Publish          # anunță postarea nouă (fan-out)
+              Resource: !Ref PostEventsTopic
+        # Permisiunile de CloudWatch Logs vin automat, din managed policy-ul
+        # AWSLambdaBasicExecutionRole pe care SAM îl atașează singur.
+      Events:
+        CreatePost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BlogApi   # OBLIGATORIU! Fără el, SAM creează în tăcere
+            Path: /posts          # un al DOILEA API, complet neprotejat.
+            Method: POST
+            # fără `Auth` => moștenește DefaultAuthorizer => rută protejată
+
+  GetPostsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: getPosts.handler
+      Description: Listează toate postările (public)
+      Environment:
+        Variables:
+          IMAGES_BUCKET: !Ref ImagesBucket
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Scan        # DOAR citire. Nu poate strica date.
+              Resource: !GetAtt PostsTable.Arn
+            - Effect: Allow
+              # Necesare pentru presigned GET URLs către imaginile postărilor.
+              Action: s3:GetObject
+              Resource: !Sub '${ImagesBucket.Arn}/uploads/*'
+      Events:
+        GetPosts:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BlogApi
+            Path: /posts
+            Method: GET
+            Auth:
+              # Excepție de la DefaultAuthorizer: citirea e publică.
+              # `NONE` e literal string-ul acceptat de SAM pentru asta.
+              Authorizer: NONE
+
+  DeletePostFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: deletePost.handler
+      Description: Șterge o postare proprie (necesită autentificare)
+      Policies:
+        - Statement:
+            - Effect: Allow
+              # Doar DeleteItem — fără GetItem, fiindcă verificarea de
+              # proprietate se face prin ConditionExpression, nu prin citire.
+              Action: dynamodb:DeleteItem
+              Resource: !GetAtt PostsTable.Arn
+      Events:
+        DeletePost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BlogApi
+            Path: /posts/{postId}
+            Method: DELETE
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 5. S3 — imaginile postărilor (upload direct din browser cu presigned URL)
+  # ────────────────────────────────────────────────────────────────────────
+  # Bucketul e complet privat: browserul urcă/citește DOAR prin presigned URLs,
+  # semnate de Lambda cu permisiunile ei. Numele e fixat cu !Sub ca să poată fi
+  # referit în QueuePolicy fără dependență circulară bucket↔coadă.
+  ImagesBucket:
+    Type: AWS::S3::Bucket
+    # Politica de coadă trebuie să existe Înainte ca S3 să valideze notificarea.
+    DependsOn: ImageEventsQueuePolicy
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-images'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          # PUT-ul presigned pleacă din browser => S3 trebuie să accepte originea.
+          # (Afișarea imaginilor prin <img> nu are nevoie de CORS.)
+          - AllowedOrigins:
+              - !Ref AllowedOrigin
+              - !Sub 'https://${SiteDistribution.DomainName}'
+            AllowedMethods: [PUT]
+            AllowedHeaders: ['*']
+            MaxAge: 300
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Queue: !GetAtt ImageEventsQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+
+  GetUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: getUploadUrl.handler
+      Description: Generează presigned URL pentru upload de imagini (necesită autentificare)
+      Environment:
+        Variables:
+          IMAGES_BUCKET: !Ref ImagesBucket
+      Policies:
+        - Statement:
+            - Effect: Allow
+              # Presigned URL-ul împrumută permisiunile funcției care l-a semnat,
+              # deci funcția are nevoie de PutObject deși nu urcă ea însăși nimic.
+              Action: s3:PutObject
+              Resource: !Sub '${ImagesBucket.Arn}/uploads/*'
+      Events:
+        GetUploadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BlogApi
+            Path: /uploads
+            Method: POST
+            # fără `Auth` => moștenește DefaultAuthorizer => rută protejată
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 6. SNS + SQS — fan-out la postare nouă
+  # ────────────────────────────────────────────────────────────────────────
+  # Modelul clasic „fan-out”: createPost publică UN mesaj în topic, iar SNS îl
+  # livrează TUTUROR abonaților (email + coadă SQS). Producătorul nu știe și
+  # nu-i pasă câți consumatori există — decuplare totală.
+  PostEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-post-events'
+
+  # Abonament email, creat doar dacă s-a dat parametrul NotificationEmail.
+  # SNS trimite întâi un mail de confirmare — fără confirmare nu livrează nimic.
+  PostEventsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref PostEventsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  PostEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-post-events'
+      # Regulă practică: VisibilityTimeout >= timeout-ul funcției consumatoare,
+      # altfel mesajul redevine vizibil în timp ce Lambda încă lucrează la el.
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PostEventsDLQ.Arn
+        maxReceiveCount: 3   # după 3 eșecuri, mesajul merge în DLQ
+
+  # Dead-letter queue: mesajele „otrăvite” ajung aici în loc să se piardă
+  # sau să blocheze coada la nesfârșit. Le poți inspecta din consolă.
+  PostEventsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-post-events-dlq'
+      MessageRetentionPeriod: 1209600   # 14 zile, maximul SQS
+
+  PostEventsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref PostEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt PostEventsQueue.Arn
+      # Fără asta, SNS împachetează mesajul într-un plic JSON propriu și
+      # consumatorul ar trebui să despacheteze două straturi.
+      RawMessageDelivery: true
+
+  # SQS nu acceptă mesaje de la nimeni implicit — topicul are nevoie de
+  # permisiune explicită, restrânsă la ARN-ul lui prin aws:SourceArn.
+  PostEventsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref PostEventsQueue]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt PostEventsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref PostEventsTopic
+
+  ProcessPostEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: processPostEvent.handler
+      Description: Consumă evenimentele de postare din SQS (marchează notifiedAt)
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt PostsTable.Arn
+      Events:
+        FromQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt PostEventsQueue.Arn
+            BatchSize: 10
+            # Permite raportarea eșecurilor PER MESAJ: doar mesajele picate se
+            # reîncearcă, nu tot batch-ul. (Întrebare frecventă la DVA-C02.)
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 7. S3 → SQS — procesarea upload-urilor de imagini
+  # ────────────────────────────────────────────────────────────────────────
+  # De ce prin SQS și nu S3→Lambda direct? Coada absoarbe vârfurile de trafic,
+  # oferă retry + DLQ gratuit și decuplează producătorul de consumator.
+  ImageEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-image-events'
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ImageEventsDLQ.Arn
+        maxReceiveCount: 3
+
+  ImageEventsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-image-events-dlq'
+      MessageRetentionPeriod: 1209600
+
+  ImageEventsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref ImageEventsQueue]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ImageEventsQueue.Arn
+            Condition:
+              ArnEquals:
+                # ARN construit manual (nu !GetAtt ImagesBucket.Arn) ca să rupem
+                # cercul: bucketul depinde de politică, nu și invers.
+                aws:SourceArn: !Sub 'arn:aws:s3:::${AWS::StackName}-images'
+
+  ProcessImageUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: processImageUpload.handler
+      Description: Procesează evenimentele S3 de upload imagini, venite prin SQS
+      Policies:
+        - Statement:
+            - Effect: Allow
+              # HeadObject (metadate) e acoperit de GetObject.
+              Action: s3:GetObject
+              Resource: !Sub 'arn:aws:s3:::${AWS::StackName}-images/uploads/*'
+      Events:
+        FromQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ImageEventsQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 8. Hosting frontend — S3 privat + CloudFront cu Origin Access Control
+  # ────────────────────────────────────────────────────────────────────────
+  # Bucketul NU e „static website” public: rămâne privat, iar CloudFront e
+  # singurul care poate citi din el (OAC semnează cererile către S3).
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-site'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-site-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'Frontend ${AWS::StackName}'
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100   # doar edge-uri EU/US — suficient și ieftin
+        Origins:
+          - Id: site-s3
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''   # gol: folosim OAC, nu vechiul OAI
+        DefaultCacheBehavior:
+          TargetOriginId: site-s3
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          # Managed policy „CachingOptimized”. La fiecare deploy invalidăm /*.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${SiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}'
+
+# ────────────────────────────────────────────────────────────────────────
+# Outputs — valorile de care ai nevoie după deploy (pentru frontend/config.js)
+# ────────────────────────────────────────────────────────────────────────
+Outputs:
+  ApiUrl:
+    Description: URL-ul de bază al API-ului
+    Value: !Sub 'https://${BlogApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}'
+
+  UserPoolId:
+    Description: ID-ul Cognito User Pool
+    Value: !Ref UserPool
+
+  UserPoolClientId:
+    Description: ID-ul App Client (folosit la login din browser)
+    Value: !Ref UserPoolClient
+
+  Region:
+    Description: Regiunea AWS
+    Value: !Ref AWS::Region
+
+  PostsTableName:
+    Description: Numele tabelului DynamoDB
+    Value: !Ref PostsTable
+
+  ImagesBucketName:
+    Description: Bucketul S3 cu imaginile postărilor
+    Value: !Ref ImagesBucket
+
+  SiteBucketName:
+    Description: Bucketul S3 din care CloudFront servește frontendul
+    Value: !Ref SiteBucket
+
+  SiteUrl:
+    Description: URL-ul public al sitului (CloudFront)
+    Value: !Sub 'https://${SiteDistribution.DomainName}'
+
+  SiteDistributionId:
+    Description: ID-ul distribuției CloudFront (pentru invalidări de cache)
+    Value: !Ref SiteDistribution
+
+  PostEventsTopicArn:
+    Description: Topicul SNS cu evenimentele de postare
+    Value: !Ref PostEventsTopic

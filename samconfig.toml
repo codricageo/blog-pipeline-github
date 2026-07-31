@@ -1,0 +1,13 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "blog-serveless"
+resolve_s3 = true
+s3_prefix = "blog-serveless"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "StageName=\"prod\" AllowedOrigin=\"http://localhost:8000\""
+image_repositories = []
+
+[default.global.parameters]
+region = "eu-central-1"

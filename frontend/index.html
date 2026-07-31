@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Blog serverless</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+    h1 { margin-bottom: 0.25rem; }
+    section { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1.5rem; }
+    input, textarea, button { font: inherit; width: 100%; padding: 0.5rem; margin-bottom: 0.5rem; box-sizing: border-box; }
+    button { cursor: pointer; background: #0b5; color: #fff; border: none; border-radius: 4px; }
+    button.secondary { background: #666; }
+    button.link { background: transparent; color: #075; padding: 0; width: auto; text-decoration: underline; }
+    button.danger { background: #c33; width: auto; padding: 0.25rem 0.75rem; font-size: 0.85rem; }
+    article { border-top: 1px solid #eee; padding: 0.75rem 0; }
+    article h3 { margin: 0 0 0.25rem; }
+    article img { max-width: 100%; max-height: 320px; border-radius: 4px; margin-top: 0.5rem; }
+    .meta { color: #777; font-size: 0.85rem; }
+    .hidden { display: none; }
+    #status { padding: 0.5rem; border-radius: 4px; margin-bottom: 1rem; }
+    #status.err { background: #fee; color: #900; }
+    #status.ok  { background: #efe; color: #060; }
+  </style>
+</head>
+<body>
+  <h1>Blog serverless</h1>
+  <p class="meta">Citirea e publică. Crearea și ștergerea cer autentificare.</p>
+
+  <div id="status" class="hidden"></div>
+
+  <!-- ── Autentificare și înregistrare ───────────────────────────── -->
+  <section id="loginSection">
+    <h2>Autentificare</h2>
+    <input id="email" type="email" placeholder="email" autocomplete="username">
+    <input id="password" type="password" placeholder="parolă" autocomplete="current-password">
+    <button id="loginBtn">Login</button>
+    <p class="meta">Nu ai cont? <button id="showSignupBtn" class="link" type="button">Înregistrează-te</button></p>
+  </section>
+
+  <section id="signupSection" class="hidden">
+    <h2>Înregistrare</h2>
+    <input id="signupEmail" type="email" placeholder="email" autocomplete="email">
+    <input id="signupPassword" type="password" placeholder="parolă" autocomplete="new-password">
+    <input id="signupPasswordConfirm" type="password" placeholder="confirmă parola" autocomplete="new-password">
+    <button id="signupBtn">Creează contul</button>
+    <p class="meta">Ai deja cont? <button id="showLoginBtn" class="link" type="button">Autentifică-te</button></p>
+  </section>
+
+  <section id="confirmSection" class="hidden">
+    <h2>Confirmă emailul</h2>
+    <p class="meta">Am trimis un cod la <strong id="confirmEmail"></strong>.</p>
+    <input id="confirmCode" type="text" inputmode="numeric" maxlength="6" placeholder="codul din email" autocomplete="one-time-code">
+    <button id="confirmBtn">Confirmă contul</button>
+    <p class="meta"><button id="resendCodeBtn" class="link" type="button">Retrimite codul</button></p>
+  </section>
+
+  <section id="userSection" class="hidden">
+    <p>Autentificat ca <strong id="whoami"></strong></p>
+    <button id="logoutBtn" class="secondary">Logout</button>
+  </section>
+
+  <!-- ── Postare nouă (doar pentru useri logați) ──────────────────── -->
+  <section id="createSection" class="hidden">
+    <h2>Postare nouă</h2>
+    <input id="title" placeholder="Titlu">
+    <textarea id="content" rows="4" placeholder="Conținut"></textarea>
+    <label class="meta" for="image">Imagine (opțional, max 5 MB)</label>
+    <input id="image" type="file" accept="image/jpeg,image/png,image/webp,image/gif">
+    <button id="createBtn">Publică</button>
+  </section>
+
+  <!-- ── Lista de postări ─────────────────────────────────────────── -->
+  <section>
+    <h2>Postări</h2>
+    <button id="refreshBtn" class="secondary">Reîncarcă</button>
+    <div id="posts"></div>
+  </section>
+
+  <script>
+    const configScript = document.createElement('script');
+    configScript.src = `config.js?updated=${Date.now()}`;
+    configScript.onload = () => {
+      const appScript = document.createElement('script');
+      appScript.src = 'app.js';
+      document.body.append(appScript);
+    };
+    document.head.append(configScript);
+  </script>
+</body>
+</html>
