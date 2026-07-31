@@ -176,14 +176,6 @@ Resources:
 
   CreatePostFunction:
     Type: AWS::Serverless::Function
-    # esbuild adună tot codul + SDK-ul într-un singur fișier: pachet mic, cold
-    # start rapid și fără node_modules (care depășea limita de cale Windows).
-    Metadata:
-      BuildMethod: esbuild
-      BuildProperties:
-        Target: node22
-        Minify: false          # stack trace-uri lizibile — proiect de învățare
-        EntryPoints: [createPost.mjs]
     Properties:
       Handler: createPost.handler
       Description: Creează o postare (necesită autentificare)
@@ -214,12 +206,6 @@ Resources:
 
   GetPostsFunction:
     Type: AWS::Serverless::Function
-    Metadata:
-      BuildMethod: esbuild
-      BuildProperties:
-        Target: node22
-        Minify: false
-        EntryPoints: [getPosts.mjs]
     Properties:
       Handler: getPosts.handler
       Description: Listează toate postările (public)
@@ -249,12 +235,6 @@ Resources:
 
   DeletePostFunction:
     Type: AWS::Serverless::Function
-    Metadata:
-      BuildMethod: esbuild
-      BuildProperties:
-        Target: node22
-        Minify: false
-        EntryPoints: [deletePost.mjs]
     Properties:
       Handler: deletePost.handler
       Description: Șterge o postare proprie (necesită autentificare)
@@ -312,12 +292,6 @@ Resources:
 
   GetUploadUrlFunction:
     Type: AWS::Serverless::Function
-    Metadata:
-      BuildMethod: esbuild
-      BuildProperties:
-        Target: node22
-        Minify: false
-        EntryPoints: [getUploadUrl.mjs]
     Properties:
       Handler: getUploadUrl.handler
       Description: Generează presigned URL pentru upload de imagini (necesită autentificare)
@@ -409,12 +383,6 @@ Resources:
 
   ProcessPostEventFunction:
     Type: AWS::Serverless::Function
-    Metadata:
-      BuildMethod: esbuild
-      BuildProperties:
-        Target: node22
-        Minify: false
-        EntryPoints: [processPostEvent.mjs]
     Properties:
       Handler: processPostEvent.handler
       Description: Consumă evenimentele de postare din SQS (marchează notifiedAt)
@@ -472,12 +440,6 @@ Resources:
 
   ProcessImageUploadFunction:
     Type: AWS::Serverless::Function
-    Metadata:
-      BuildMethod: esbuild
-      BuildProperties:
-        Target: node22
-        Minify: false
-        EntryPoints: [processImageUpload.mjs]
     Properties:
       Handler: processImageUpload.handler
       Description: Procesează evenimentele S3 de upload imagini, venite prin SQS
